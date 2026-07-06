@@ -42,6 +42,7 @@ struct Config: ConvenienceMutable {
     var defaultRootContainerLayout: Layout = .tiles
     var defaultRootContainerOrientation: DefaultContainerOrientation = .auto
     var windowInsertion: WindowInsertion = .i3
+    var macosNativeTabs: Bool = false // Fork(dwindle): exclude background native macOS tabs (CGWindow offscreen) from tiling
     var startAtLogin: Bool = false
     var autoReloadConfig: Bool = false
     var automaticallyUnhideMacosHiddenApps: Bool = false

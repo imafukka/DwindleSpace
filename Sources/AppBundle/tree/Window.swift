@@ -46,6 +46,9 @@ enum LayoutReason: Equatable {
     case standard
     /// Reason for the cur temp layout is macOS native fullscreen, minimize, or hide
     case macos(prevParentKind: NonLeafTreeNodeKind)
+    /// Fork(dwindle): window parked out of tiling because it's a background native macOS tab
+    /// (kCGWindowIsOnscreen == false). Returns to tiling once it becomes on-screen again.
+    case macosNativeTab(prevParentKind: NonLeafTreeNodeKind)
 }
 
 extension Window {
