@@ -102,10 +102,18 @@ final class MacApp: AbstractApp {
     func closeAndUnregisterAxWindow(_ windowId: UInt32) {
         if serverArgs.isReadOnly { return }
         setFrameJobs.removeValue(forKey: windowId)?.cancel()
-        _ = withWindowAsync(windowId, .cancellable) { [windows] window, job in
-            guard let closeButton = window.get(Ax.closeButtonAttr) else { return }
-            if AXUIElementPerformAction(closeButton.cast, kAXPressAction as CFString) == .success {
-                windows.threadGuarded.removeValue(forKey: windowId)
+        _ = withWindowAsync(windowId, .cancellable) { [windows, pid] window, job in
+            if let closeButton = window.get(Ax.closeButtonAttr) {
+                if AXUIElementPerformAction(closeButton.cast, kAXPressAction as CFString) == .success {
+                    windows.threadGuarded.removeValue(forKey: windowId)
+                }
+            } else {
+                // Fork(dwindle): borderless windows (e.g. kitty with `hide_window_decorations`)
+                // expose no AXCloseButton, so `close` used to be a silent no-op. Fall back to the
+                // standard macOS "Close Window" shortcut ⌘W posted to the owning app. App-agnostic;
+                // assumes the target is the app's focused window (always true for `close` on the
+                // focused window). The window's destroy notification will unregister it.
+                postCmdWToPid(pid)
             }
         }
     }
@@ -433,4 +441,17 @@ private func disableAnimations<T>(app: AXUIElement, _ job: RunLoopJob, _ body: (
     }
     try job.checkCancellation()
     return try body()
+}
+
+// Fork(dwindle): fallback for closing borderless windows that expose no AXCloseButton.
+// Posts ⌘W (standard macOS "Close Window") straight to the target app. See closeAndUnregisterAxWindow.
+private func postCmdWToPid(_ pid: pid_t) {
+    let vkW: CGKeyCode = 0x0D // kVK_ANSI_W
+    let src = CGEventSource(stateID: .hidSystemState)
+    guard let down = CGEvent(keyboardEventSource: src, virtualKey: vkW, keyDown: true),
+          let up = CGEvent(keyboardEventSource: src, virtualKey: vkW, keyDown: false) else { return }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
+    down.postToPid(pid)
+    up.postToPid(pid)
 }
