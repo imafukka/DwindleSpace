@@ -223,6 +223,9 @@ private func unbindAndGetBindingDataForNewTilingWindow(_ workspace: Workspace, w
     window?.unbindFromParent() // It's important to unbind to get correct data from below
     let mruWindow = workspace.mostRecentWindowRecursive
     if let mruWindow, let tilingParent = mruWindow.parent as? TilingContainer {
+        if config.windowInsertion == .dwindle && tilingParent.layout == .tiles {
+            return unbindMruAndGetDwindleBindingData(mruWindow, tilingParent)
+        }
         return BindingData(
             parent: tilingParent,
             adaptiveWeight: WEIGHT_AUTO,
@@ -235,6 +238,26 @@ private func unbindAndGetBindingDataForNewTilingWindow(_ workspace: Workspace, w
             index: INDEX_BIND_LAST,
         )
     }
+}
+
+// Dwindle (bsp-like) insertion: the new window splits the most recently used window's tile
+// instead of becoming its sibling. Split orientation is chosen by the tile's aspect ratio
+// (the longer side gets split), which is how Hyprland's dwindle layout behaves.
+@MainActor
+private func unbindMruAndGetDwindleBindingData(_ mruWindow: Window, _ tilingParent: TilingContainer) -> BindingData {
+    let tileRect = mruWindow.lastAppliedLayoutPhysicalRect ?? mruWindow.lastAppliedLayoutVirtualRect
+    let orientation: Orientation = tileRect.map { $0.width > $0.height ? .h : .v }
+        ?? tilingParent.orientation.opposite
+    let mruBinding = mruWindow.unbindFromParent()
+    let split = TilingContainer(
+        parent: mruBinding.parent,
+        adaptiveWeight: mruBinding.adaptiveWeight,
+        orientation,
+        .tiles,
+        index: mruBinding.index,
+    )
+    mruWindow.bind(to: split, adaptiveWeight: WEIGHT_AUTO, index: 0)
+    return BindingData(parent: split, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
 }
 
 @MainActor
