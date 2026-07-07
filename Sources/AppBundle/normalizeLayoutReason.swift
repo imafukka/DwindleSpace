@@ -1,15 +1,19 @@
-// Fork(dwindle): consecutive refresh ticks a window has been offscreen-while-tiled. Debounce so
-// freshly created windows (briefly offscreen at creation) aren't mistaken for background native tabs.
+// Fork(dwindle): consecutive refresh ticks a window has been offscreen-while-tiled. Only NEW windows
+// (never yet seen on-screen) are debounced — a freshly created window can be briefly offscreen while
+// it settles. An established window that goes offscreen is a tab going to the background and is parked
+// on the same tick (before layout), so there is no visible relayout jump.
 @MainActor private var nativeTabOffscreenTicks: [UInt32: Int] = [:]
+@MainActor private var nativeTabSeenOnscreen: Set<UInt32> = []
 private let nativeTabOffscreenThreshold = 2
 
 @MainActor
 func normalizeLayoutReason() async throws {
     // Fork(dwindle): computed once per tick, only when the native-tabs feature is enabled.
     let onscreenIds: Set<UInt32> = config.macosNativeTabs ? getOnscreenWindowIds() : []
-    if config.macosNativeTabs { // keep the debounce map from leaking dead window ids
+    if config.macosNativeTabs { // keep the tracking maps from leaking dead window ids
         let alive = Set(MacWindow.allWindowsMap.keys)
         nativeTabOffscreenTicks = nativeTabOffscreenTicks.filter { alive.contains($0.key) }
+        nativeTabSeenOnscreen = nativeTabSeenOnscreen.filter { alive.contains($0) }
     }
     for workspace in Workspace.all {
         let windows: [Window] = workspace.allLeafWindowsRecursive
@@ -30,17 +34,24 @@ private func isBackgroundNativeTab(
     isMacosWindowOfHiddenApp: Bool,
     onscreenIds: Set<UInt32>,
 ) -> Bool {
+    let id = window.windowId
+    // A window we've seen genuinely on-screen is an established window; when it later goes off-screen
+    // it's a tab that went to the background, so it can be parked immediately.
+    if onscreenIds.contains(id) { nativeTabSeenOnscreen.insert(id) }
     guard config.macosNativeTabs,
           !isMacosFullscreen, !isMacosMinimized, !isMacosWindowOfHiddenApp,
           parent.kind == .tilingContainer, // phantom tiles only happen in tiling
           window.nodeWorkspace?.isVisible == true, // never touch windows on hidden workspaces
-          !onscreenIds.contains(window.windowId)
+          !onscreenIds.contains(id)
     else {
-        nativeTabOffscreenTicks.removeValue(forKey: window.windowId)
+        nativeTabOffscreenTicks.removeValue(forKey: id)
         return false
     }
-    let n = (nativeTabOffscreenTicks[window.windowId] ?? 0) + 1
-    nativeTabOffscreenTicks[window.windowId] = n
+    // Established window (was on-screen before) → park now, on the same tick, before layout runs.
+    if nativeTabSeenOnscreen.contains(id) { return true }
+    // Never seen on-screen yet (freshly created?) → debounce so it isn't parked while it's settling.
+    let n = (nativeTabOffscreenTicks[id] ?? 0) + 1
+    nativeTabOffscreenTicks[id] = n
     return n >= nativeTabOffscreenThreshold
 }
 
