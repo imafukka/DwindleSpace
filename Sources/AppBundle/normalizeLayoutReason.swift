@@ -6,6 +6,16 @@
 @MainActor private var nativeTabSeenOnscreen: Set<UInt32> = []
 private let nativeTabOffscreenThreshold = 2
 
+// Fork(dwindle): a tiling slot vacated on this tick by a tab that went to the background. The tab of the
+// same app that came to the foreground takes this exact slot (parent, index, weight) instead of a fresh
+// dwindle insertion — otherwise it would split whatever window is MRU now, using that window's stale
+// pre-layout rect, and switching tabs would reshape the layout.
+private struct VacatedNativeTabSlot {
+    let pid: Int32
+    let binding: BindingData
+    let rect: Rect?
+}
+
 @MainActor
 func normalizeLayoutReason() async throws {
     // Fork(dwindle): computed once per tick, only when the native-tabs feature is enabled.
@@ -15,11 +25,14 @@ func normalizeLayoutReason() async throws {
         nativeTabOffscreenTicks = nativeTabOffscreenTicks.filter { alive.contains($0.key) }
         nativeTabSeenOnscreen = nativeTabSeenOnscreen.filter { alive.contains($0) }
     }
+    // Fork(dwindle): background tabs are parked in the workspace pass, foreground tabs return in the
+    // minimized pass after it — so a returning tab always sees the slots vacated on this tick.
+    var vacatedTabSlots: [VacatedNativeTabSlot] = []
     for workspace in Workspace.all {
         let windows: [Window] = workspace.allLeafWindowsRecursive
-        try await _normalizeLayoutReason(workspace: workspace, windows: windows, onscreenIds: onscreenIds)
+        try await _normalizeLayoutReason(workspace: workspace, windows: windows, onscreenIds: onscreenIds, vacatedTabSlots: &vacatedTabSlots)
     }
-    try await _normalizeLayoutReason(workspace: focus.workspace, windows: macosMinimizedWindowsContainer.children.filterIsInstance(of: Window.self), onscreenIds: onscreenIds)
+    try await _normalizeLayoutReason(workspace: focus.workspace, windows: macosMinimizedWindowsContainer.children.filterIsInstance(of: Window.self), onscreenIds: onscreenIds, vacatedTabSlots: &vacatedTabSlots)
     try await validateStillPopups()
 }
 
@@ -68,7 +81,12 @@ private func validateStillPopups() async throws {
 }
 
 @MainActor
-private func _normalizeLayoutReason(workspace: Workspace, windows: [Window], onscreenIds: Set<UInt32>) async throws {
+private func _normalizeLayoutReason(
+    workspace: Workspace,
+    windows: [Window],
+    onscreenIds: Set<UInt32>,
+    vacatedTabSlots: inout [VacatedNativeTabSlot],
+) async throws {
     for window in windows {
         let isMacosFullscreen = try await window.isMacosFullscreen(.cancellable)
         let isMacosMinimized = try await (!isMacosFullscreen).andAsync { @MainActor @Sendable in try await window.isMacosMinimized(.cancellable) }
@@ -92,8 +110,12 @@ private func _normalizeLayoutReason(workspace: Workspace, windows: [Window], ons
                     case isBgNativeTab:
                         // Fork(dwindle): park the background tab out of tiling (reuse the minimized
                         // container as physical storage; the .macosNativeTab reason routes its return).
+                        // The vacated slot is remembered for the foreground tab returning on this tick.
                         window.layoutReason = .macosNativeTab(prevParentKind: parent.kind)
-                        window.bind(to: macosMinimizedWindowsContainer, adaptiveWeight: 1, index: INDEX_BIND_LAST)
+                        let rect = window.lastAppliedLayoutPhysicalRect
+                        if let slot = window.bind(to: macosMinimizedWindowsContainer, adaptiveWeight: 1, index: INDEX_BIND_LAST) {
+                            vacatedTabSlots.append(VacatedNativeTabSlot(pid: window.app.pid, binding: slot, rect: rect))
+                        }
                     default: break
                 }
             case .macos(let prevParentKind):
@@ -101,13 +123,34 @@ private func _normalizeLayoutReason(workspace: Workspace, windows: [Window], ons
                     try await exitMacOsNativeUnconventionalState(window: window, prevParentKind: prevParentKind, workspace: workspace, .cancellable)
                 }
             case .macosNativeTab(let prevParentKind):
-                // Fork(dwindle): the tab came back to the foreground (on-screen) — return it to tiling.
+                // Fork(dwindle): the tab came back to the foreground (on-screen) — return it to tiling,
+                // into the slot of the tab it replaced if one was vacated on this tick.
                 if onscreenIds.contains(window.windowId) {
                     nativeTabOffscreenTicks.removeValue(forKey: window.windowId)
-                    try await exitMacOsNativeUnconventionalState(window: window, prevParentKind: prevParentKind, workspace: workspace, .cancellable)
+                    if let slot = try await takeVacatedNativeTabSlot(for: window, &vacatedTabSlots) {
+                        window.layoutReason = .standard
+                        window.bind(to: slot.parent, adaptiveWeight: slot.adaptiveWeight, index: min(slot.index, slot.parent.children.count))
+                    } else {
+                        try await exitMacOsNativeUnconventionalState(window: window, prevParentKind: prevParentKind, workspace: workspace, .cancellable)
+                    }
                 }
         }
     }
+}
+
+// Fork(dwindle): pick a slot vacated on this tick by a background tab of the same app. Tabs of one group
+// share a frame, so when several slots match (several tabbed windows of one app switched at once) the
+// one whose tile is closest to the returning window's frame wins.
+@MainActor
+private func takeVacatedNativeTabSlot(for window: Window, _ slots: inout [VacatedNativeTabSlot]) async throws -> BindingData? {
+    let candidates = slots.indices.filter { i in
+        slots[i].pid == window.app.pid && slots[i].binding.parent is TilingContainer && slots[i].binding.parent.nodeWorkspace != nil
+    }
+    guard var best = candidates.first else { return nil }
+    if candidates.count > 1, let rect = try await window.getAxRect(.cancellable) {
+        best = candidates.minBy { i in slots[i].rect.map { ($0.center - rect.center).vectorLength } ?? .infinity } ?? best
+    }
+    return slots.remove(at: best).binding
 }
 
 @MainActor
