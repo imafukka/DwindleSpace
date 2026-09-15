@@ -5,6 +5,11 @@
 @MainActor private var nativeTabOffscreenTicks: [UInt32: Int] = [:]
 @MainActor private var nativeTabSeenOnscreen: Set<UInt32> = []
 private let nativeTabOffscreenThreshold = 2
+// Fork(dwindle): refresh tick counter and the tick each window was first seen on, to tell freshly opened
+// windows apart (see adoptFreshNativeTabWindows).
+@MainActor private var nativeTabTick = 0
+@MainActor private var nativeTabFirstSeenTick: [UInt32: Int] = [:]
+private let nativeTabFreshTicks = 2
 
 // Fork(dwindle): a tiling slot vacated on this tick by a tab that went to the background. The tab of the
 // same app that came to the foreground takes this exact slot (parent, index, weight) instead of a fresh
@@ -14,6 +19,7 @@ private struct VacatedNativeTabSlot {
     let pid: Int32
     let binding: BindingData
     let rect: Rect?
+    let isEstablishedTab: Bool // the parked tab had been on-screen before (not a never-shown background tab)
 }
 
 @MainActor
@@ -24,6 +30,9 @@ func normalizeLayoutReason() async throws {
         let alive = Set(MacWindow.allWindowsMap.keys)
         nativeTabOffscreenTicks = nativeTabOffscreenTicks.filter { alive.contains($0.key) }
         nativeTabSeenOnscreen = nativeTabSeenOnscreen.filter { alive.contains($0) }
+        nativeTabTick += 1
+        nativeTabFirstSeenTick = nativeTabFirstSeenTick.filter { alive.contains($0.key) }
+        for id in alive where nativeTabFirstSeenTick[id] == nil { nativeTabFirstSeenTick[id] = nativeTabTick }
     }
     // Fork(dwindle): background tabs are parked in the workspace pass, foreground tabs return in the
     // minimized pass after it — so a returning tab always sees the slots vacated on this tick.
@@ -33,6 +42,7 @@ func normalizeLayoutReason() async throws {
         try await _normalizeLayoutReason(workspace: workspace, windows: windows, onscreenIds: onscreenIds, vacatedTabSlots: &vacatedTabSlots)
     }
     try await _normalizeLayoutReason(workspace: focus.workspace, windows: macosMinimizedWindowsContainer.children.filterIsInstance(of: Window.self), onscreenIds: onscreenIds, vacatedTabSlots: &vacatedTabSlots)
+    if config.macosNativeTabs { adoptFreshNativeTabWindows(vacatedTabSlots, onscreenIds: onscreenIds) }
     try await validateStillPopups()
 }
 
@@ -114,7 +124,8 @@ private func _normalizeLayoutReason(
                         window.layoutReason = .macosNativeTab(prevParentKind: parent.kind)
                         let rect = window.lastAppliedLayoutPhysicalRect
                         if let slot = window.bind(to: macosMinimizedWindowsContainer, adaptiveWeight: 1, index: INDEX_BIND_LAST) {
-                            vacatedTabSlots.append(VacatedNativeTabSlot(pid: window.app.pid, binding: slot, rect: rect))
+                            vacatedTabSlots.append(VacatedNativeTabSlot(pid: window.app.pid, binding: slot, rect: rect,
+                                isEstablishedTab: nativeTabSeenOnscreen.contains(window.windowId)))
                         }
                     default: break
                 }
@@ -151,6 +162,28 @@ private func takeVacatedNativeTabSlot(for window: Window, _ slots: inout [Vacate
         best = candidates.minBy { i in slots[i].rect.map { ($0.center - rect.center).vectorLength } ?? .infinity } ?? best
     }
     return slots.remove(at: best).binding
+}
+
+// Fork(dwindle): a new tab opened from another app (e.g. a PDF double-clicked in Finder) is registered as a new
+// window and dwindle-inserted next to the MRU window — Finder — instead of the tab it replaces, which reshapes
+// the layout once that tab is parked. For each slot still vacated by an established tab after the return pass,
+// move a freshly registered on-screen tiled window of the same app on that workspace into it. Ambiguous
+// (several fresh windows) → keep the dwindle placement.
+@MainActor
+private func adoptFreshNativeTabWindows(_ slots: [VacatedNativeTabSlot], onscreenIds: Set<UInt32>) {
+    for slot in slots where slot.isEstablishedTab {
+        guard let parent = slot.binding.parent as? TilingContainer, let workspace = parent.nodeWorkspace else { continue }
+        let fresh = workspace.allLeafWindowsRecursive.filter { w in
+            w.app.pid == slot.pid && w.parent is TilingContainer && onscreenIds.contains(w.windowId) &&
+                nativeTabFirstSeenTick[w.windowId].map { nativeTabTick - $0 <= nativeTabFreshTicks } == true
+        }
+        guard let window = fresh.singleOrNil() else { continue }
+        let sameParent = window.parent === parent
+        var index = slot.binding.index
+        if sameParent, let ownIndex = window.ownIndex, ownIndex < index { index -= 1 }
+        index = min(index, parent.children.count - (sameParent ? 1 : 0))
+        window.bind(to: parent, adaptiveWeight: slot.binding.adaptiveWeight, index: index)
+    }
 }
 
 @MainActor
